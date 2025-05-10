@@ -1,0 +1,373 @@
+import os
+import re
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+from torchvision import transforms, models
+from PIL import Image, ImageOps
+import random
+from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+import seaborn as sns
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Hyperparameters
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 20
+IMAGE_SIZE = (288, 384)
+VALIDATION_SPLIT = 0.2
+TEST_SPLIT = 0.1
+
+class FingerPrintDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.data_dir = data_dir
+        self.transform = transform
+        self.image_paths = []
+        self.labels = []  # Person IDs
+        
+        # Get all TIFF files
+        for filename in os.listdir(data_dir):
+            if filename.endswith('.tif'):
+                # Parse filename to extract person ID (xxx)
+                match = re.match(r'(\d+)_\d+_\d+\.tif', filename)
+                if match:
+                    person_id = int(match.group(1))
+                    self.image_paths.append(os.path.join(data_dir, filename))
+                    self.labels.append(person_id)
+        
+        # Get unique person IDs and map them to indices
+        self.unique_labels = sorted(list(set(self.labels)))
+        self.label_to_idx = {label: idx for idx, label in enumerate(self.unique_labels)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+        
+        # Convert all labels to indices
+        self.labels = [self.label_to_idx[label] for label in self.labels]
+        
+        print(f"Found {len(self.image_paths)} images from {len(self.unique_labels)} different people")
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
+        # Load image and convert to grayscale
+        image = Image.open(image_path).convert('L')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+    
+    def get_num_classes(self):
+        return len(self.unique_labels)
+
+class CustomRotationTransform:
+    def __init__(self, max_angle=15):
+        self.max_angle = max_angle
+        
+    def __call__(self, img):
+        if random.random() < 0.5:
+            angle = random.uniform(-self.max_angle, self.max_angle)
+            return img.rotate(angle, resample=Image.BILINEAR, expand=False)
+        return img
+
+class CustomShiftTransform:
+    def __init__(self, max_shift=5):
+        self.max_shift = max_shift
+        
+    def __call__(self, img):
+        if random.random() < 0.5:
+            shift_x = random.randint(-self.max_shift, self.max_shift)
+            shift_y = random.randint(-self.max_shift, self.max_shift)
+            return ImageOps.expand(img, border=(shift_x, shift_y, 0, 0), fill=0)
+        return img
+
+class NoiseTransform:
+    def __init__(self, noise_factor=0.05):
+        self.noise_factor = noise_factor
+        
+    def __call__(self, img):
+        if random.random() < 0.3:
+            img_array = np.array(img)
+            noise = np.random.normal(0, self.noise_factor * 255, img_array.shape)
+            noisy_img = img_array + noise
+            noisy_img = np.clip(noisy_img, 0, 255).astype(np.uint8)
+            return Image.fromarray(noisy_img)
+        return img
+
+class ContrastTransform:
+    def __init__(self, factor_range=(0.8, 1.2)):
+        self.factor_range = factor_range
+        
+    def __call__(self, img):
+        if random.random() < 0.3:
+            factor = random.uniform(*self.factor_range)
+            return ImageOps.autocontrast(img, cutoff=factor)
+        return img
+
+def get_data_transforms():
+    # Define data transformations
+    data_transforms = {
+        'train': transforms.Compose([
+            CustomRotationTransform(15),
+            CustomShiftTransform(5),
+            NoiseTransform(),
+            ContrastTransform(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ]),
+        'val': transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ]),
+        'test': transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5])
+        ])
+    }
+    return data_transforms
+
+def prepare_dataloaders(data_dir):
+    data_transforms = get_data_transforms()
+    
+    # Create dataset
+    full_dataset = FingerPrintDataset(data_dir, transform=data_transforms['train'])
+    
+    # Split dataset
+    dataset_size = len(full_dataset)
+    test_size = int(TEST_SPLIT * dataset_size)
+    val_size = int(VALIDATION_SPLIT * dataset_size)
+    train_size = dataset_size - val_size - test_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size]
+    )
+    
+    # Override transformations for validation and test sets
+    train_dataset.dataset.transform = data_transforms['train']
+    val_dataset.dataset.transform = data_transforms['val']
+    test_dataset.dataset.transform = data_transforms['test']
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+    
+    return train_loader, val_loader, test_loader, full_dataset.get_num_classes()
+
+def get_model(num_classes):
+    # Load pre-trained ResNet model
+    model = models.resnet18(weights='DEFAULT')
+    
+    # Modify the first layer to accept grayscale images (1 channel)
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    
+    # Modify the final fully connected layer for our number of classes
+    num_features = model.fc.in_features
+    model.fc = nn.Linear(num_features, num_classes)
+    
+    return model
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs):
+    best_val_acc = 0.0
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        for images, labels in train_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            # Forward pass
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * images.size(0)
+            
+            # Calculate accuracy
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+        
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        epoch_train_acc = correct / total
+        train_losses.append(epoch_train_loss)
+        train_accs.append(epoch_train_acc)
+        
+        # Validation phase
+        model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                
+                running_loss += loss.item() * images.size(0)
+                
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+        
+        epoch_val_loss = running_loss / len(val_loader.dataset)
+        epoch_val_acc = correct / total
+        val_losses.append(epoch_val_loss)
+        val_accs.append(epoch_val_acc)
+        
+        print(f'Epoch [{epoch+1}/{num_epochs}], '
+              f'Train Loss: {epoch_train_loss:.4f}, Train Acc: {epoch_train_acc:.4f}, '
+              f'Val Loss: {epoch_val_loss:.4f}, Val Acc: {epoch_val_acc:.4f}')
+        
+        # Save the best model
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            torch.save(model.state_dict(), 'best_fingerprint_model.pth')
+    
+    # Load the best model
+    model.load_state_dict(torch.load('best_fingerprint_model.pth'))
+    
+    return model, train_losses, val_losses, train_accs, val_accs
+
+def evaluate_model(model, test_loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(images)
+            _, preds = torch.max(outputs, 1)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    # Calculate precision, recall, and F1-score
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='weighted'
+    )
+    
+    # Create confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'confusion_matrix': cm
+    }
+
+def plot_metrics(train_losses, val_losses, train_accs, val_accs, test_metrics):
+    plt.figure(figsize=(15, 10))
+    
+    # Plot training and validation loss
+    plt.subplot(2, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    
+    # Plot training and validation accuracy
+    plt.subplot(2, 2, 2)
+    plt.plot(train_accs, label='Training Accuracy')
+    plt.plot(val_accs, label='Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.legend()
+    
+    # Plot precision, recall, and F1-score
+    plt.subplot(2, 2, 3)
+    metrics = ['Precision', 'Recall', 'F1-Score']
+    values = [test_metrics['precision'], test_metrics['recall'], test_metrics['f1']]
+    plt.bar(metrics, values)
+    plt.ylim(0, 1)
+    for i, v in enumerate(values):
+        plt.text(i, v + 0.01, f'{v:.4f}', ha='center')
+    plt.ylabel('Score')
+    plt.title('Test Set Metrics')
+    
+    # Plot confusion matrix
+    plt.subplot(2, 2, 4)
+    cm = test_metrics['confusion_matrix']
+    # If confusion matrix is too large, show a sample
+    if cm.shape[0] > 10:
+        cm = cm[:10, :10]  # Show only the first 10 classes
+        title = 'Confusion Matrix (First 10 Classes)'
+    else:
+        title = 'Confusion Matrix'
+    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues')
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.title(title)
+    
+    plt.tight_layout()
+    plt.savefig('fingerprint_metrics.png')
+    plt.show()
+
+def main():
+    data_dir = "fingerprint_data"
+    
+    # Prepare data
+    train_loader, val_loader, test_loader, num_classes = prepare_dataloaders(data_dir)
+    
+    # Initialize model
+    model = get_model(num_classes)
+    model = model.to(device)
+    
+    # Define loss function and optimizer
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    # Train model
+    model, train_losses, val_losses, train_accs, val_accs = train_model(
+        model, train_loader, val_loader, criterion, optimizer, NUM_EPOCHS
+    )
+    
+    # Evaluate model
+    test_metrics = evaluate_model(model, test_loader)
+    
+    print(f"Test Precision: {test_metrics['precision']:.4f}")
+    print(f"Test Recall: {test_metrics['recall']:.4f}")
+    print(f"Test F1-Score: {test_metrics['f1']:.4f}")
+    
+    # Plot metrics
+    plot_metrics(train_losses, val_losses, train_accs, val_accs, test_metrics)
+
+if __name__ == "__main__":
+    main()
