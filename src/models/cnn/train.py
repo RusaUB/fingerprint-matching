@@ -25,7 +25,7 @@ print(f"Using device: {device}")
 # Hyperparameters
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
-NUM_EPOCHS = 1
+NUM_EPOCHS = 20
 IMAGE_SIZE = (288, 384)
 VALIDATION_SPLIT = 0.2
 TEST_SPLIT = 0.1
