@@ -1,7 +1,6 @@
 import os
 import re
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +9,9 @@ from torchvision import transforms, models
 from PIL import Image, ImageOps
 import random
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-import seaborn as sns
+
+from ...utils import save_metrics_to_excel, plot_metrics
+
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -28,6 +29,13 @@ NUM_EPOCHS = 20
 IMAGE_SIZE = (288, 384)
 VALIDATION_SPLIT = 0.2
 TEST_SPLIT = 0.1
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_NAME = os.path.basename(CURRENT_DIR)
+ASSETS_DIR = os.path.join(CURRENT_DIR,"assets")
+
+if not os.path.exists(ASSETS_DIR):
+    os.makedirs(ASSETS_DIR)
 
 class FingerPrintDataset(Dataset):
     def __init__(self, data_dir, transform=None):
@@ -252,10 +260,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         # Save the best model
         if epoch_val_acc > best_val_acc:
             best_val_acc = epoch_val_acc
-            torch.save(model.state_dict(), 'best_fingerprint_model.pth')
+            torch.save(model.state_dict(), os.path.join(CURRENT_DIR, f"{MODEL_NAME}_model.pth"))
     
     # Load the best model
-    model.load_state_dict(torch.load('best_fingerprint_model.pth'))
+    model.load_state_dict(torch.load(os.path.join(CURRENT_DIR,f"{MODEL_NAME}_model.pth")))
     
     return model, train_losses, val_losses, train_accs, val_accs
 
@@ -290,55 +298,6 @@ def evaluate_model(model, test_loader):
         'confusion_matrix': cm
     }
 
-def plot_metrics(train_losses, val_losses, train_accs, val_accs, test_metrics):
-    plt.figure(figsize=(15, 10))
-    
-    # Plot training and validation loss
-    plt.subplot(2, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss')
-    plt.legend()
-    
-    # Plot training and validation accuracy
-    plt.subplot(2, 2, 2)
-    plt.plot(train_accs, label='Training Accuracy')
-    plt.plot(val_accs, label='Validation Accuracy')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-    plt.title('Training and Validation Accuracy')
-    plt.legend()
-    
-    # Plot precision, recall, and F1-score
-    plt.subplot(2, 2, 3)
-    metrics = ['Precision', 'Recall', 'F1-Score']
-    values = [test_metrics['precision'], test_metrics['recall'], test_metrics['f1']]
-    plt.bar(metrics, values)
-    plt.ylim(0, 1)
-    for i, v in enumerate(values):
-        plt.text(i, v + 0.01, f'{v:.4f}', ha='center')
-    plt.ylabel('Score')
-    plt.title('Test Set Metrics')
-    
-    # Plot confusion matrix
-    plt.subplot(2, 2, 4)
-    cm = test_metrics['confusion_matrix']
-    # If confusion matrix is too large, show a sample
-    if cm.shape[0] > 10:
-        cm = cm[:10, :10]  # Show only the first 10 classes
-        title = 'Confusion Matrix (First 10 Classes)'
-    else:
-        title = 'Confusion Matrix'
-    sns.heatmap(cm, annot=False, fmt='d', cmap='Blues')
-    plt.xlabel('Predicted Label')
-    plt.ylabel('True Label')
-    plt.title(title)
-    
-    plt.tight_layout()
-    plt.savefig('fingerprint_metrics.png')
-    plt.show()
 
 def main():
     data_dir = "fingerprint_data"
@@ -367,7 +326,9 @@ def main():
     print(f"Test F1-Score: {test_metrics['f1']:.4f}")
     
     # Plot metrics
-    plot_metrics(train_losses, val_losses, train_accs, val_accs, test_metrics)
+    plot_metrics(train_losses, val_losses, train_accs, val_accs, test_metrics, model_name=MODEL_NAME, save_dir=ASSETS_DIR)
+
+    save_metrics_to_excel(train_losses, val_losses, train_accs, val_accs, test_metrics, os.path.join(ASSETS_DIR, f"{MODEL_NAME}_evaluation.xlsx"))
 
 if __name__ == "__main__":
     main()
